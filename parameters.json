@@ -1,0 +1,9 @@
+{
+    "training": {
+        "alpha": 0.4
+    },
+    "registration": {
+        "model_name": "diabetes_regression_model",
+        "metric": "mse"
+    }
+}

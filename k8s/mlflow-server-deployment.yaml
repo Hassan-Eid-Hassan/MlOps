@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  labels:
+    app: mlflow-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow-server
+  template:
+    metadata:
+      labels:
+        app: mlflow-server
+    spec:
+      containers:
+        - name: mlflow-server
+          # Built locally in CI and loaded straight into the kind cluster
+          # (see the workflow) - no registry push needed for the demo.
+          image: mlflow-server:demo
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: mlflow-data
+              mountPath: /mlflow
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        # emptyDir keeps this demo self-contained. For anything beyond the
+        # demo, back this with a PersistentVolumeClaim (and point
+        # --default-artifact-root / the backend store at a real DB + object
+        # storage) so the registry survives pod restarts.
+        - name: mlflow-data
+          emptyDir: {}

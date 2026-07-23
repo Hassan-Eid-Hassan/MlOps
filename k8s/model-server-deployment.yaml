@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diabetes-model-server
+  labels:
+    app: diabetes-model-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: diabetes-model-server
+  template:
+    metadata:
+      labels:
+        app: diabetes-model-server
+    spec:
+      containers:
+        - name: model-server
+          # __IMAGE__ is substituted by the CI pipeline (see the workflow's
+          # "Deploy model server" step). For the demo this is
+          # diabetes-model-server:demo, built by `mlflow models build-docker`
+          # and loaded straight into the kind cluster - no registry needed.
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
