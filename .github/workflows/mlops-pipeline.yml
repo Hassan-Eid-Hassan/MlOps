@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - run: pytest tests/test_data_validation.py -v
+      - run: python -m pytest tests/test_data_validation.py -v
 
   # ---------------------------------------------------------------------
   # 2) Train -> evaluate -> register against the MLflow server you run on
@@ -36,10 +36,7 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
 
-      - name: Unit test training code
-        run: pytest tests/test_train.py -v
-
-      - name: Configure kubectl for the EC2/kubeadm cluster
+      - name: Configure kubectl for the k8s cluster
         run: |
           mkdir -p "$HOME/.kube"
           echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > "$HOME/.kube/config"

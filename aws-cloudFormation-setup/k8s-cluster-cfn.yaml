@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  1 master + 2 worker Kubernetes cluster on Amazon Linux 2 EC2 instances
+  (t3.medium, 30GB gp3 root volume). Installs Docker/containerd/kubeadm and
+  initializes the control plane on the master. Workers install prerequisites
+  only - SSH into the master, run `kubeadm token create --print-join-command`,
+  and run the resulting command on each worker to join them manually.
+  Security group allows ALL inbound/outbound traffic (lab/test use only).
+
+Parameters:
+  pKeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 KeyPair to enable SSH access to the nodes.
+
+  pVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the cluster nodes into.
+
+  pSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Public subnet (route to an Internet Gateway) for all three nodes -
+      each node gets an auto-assigned public IP for SSH / package downloads.
+
+  pLatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: >
+      Amazon Linux 2 AMI (resolved via public SSM parameter). Amazon Linux 2
+      is used because the install scripts assume a /etc/sysconfig/selinux-
+      style RHEL/AL2 layout.
+
+  pInstanceType:
+    Type: String
+    Default: t3.medium
+
+  pRootVolumeSizeGiB:
+    Type: Number
+    Default: 30
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - pVpcId
+          - pSubnetId
+      - Label:
+          default: Instance
+        Parameters:
+          - pKeyPairName
+          - pLatestAmiId
+          - pInstanceType
+          - pRootVolumeSizeGiB
+
+Resources:
+
+  K8sSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "k8s-cluster - allows ALL inbound and ALL outbound traffic (lab/test use only)"
+      VpcId: !Ref pVpcId
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-k8s-sg"
+
+  K8sMasterInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref pLatestAmiId
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyPairName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref pSubnetId
+          GroupSet:
+            - !Ref K8sSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref pRootVolumeSizeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-k8s-master"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > >(tee -a /var/log/k8s_install.log) 2>&1
+
+          POD_NETWORK_URL="https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml"
+          K8S_REPO_URL="https://pkgs.k8s.io/core:/stable:/v1.34/rpm/"
+          K8S_GPG_KEY="https://pkgs.k8s.io/core:/stable:/v1.34/rpm/repodata/repomd.xml.key"
+          POD_NETWORK_CIDR="10.244.0.0/16"
+          AUTO_HASH_SWAP="false"
+
+          echo "Starting Kubernetes master installation..."
+
+          echo "Step 1: Removing old versions..."
+          yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman runc "kube*" || true
+
+          echo "Step 2: Disabling SELinux..."
+          command -v setenforce >/dev/null 2>&1 && setenforce 0 || true
+          [ -f /etc/sysconfig/selinux ] && sed -i --follow-symlinks 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/sysconfig/selinux || true
+
+          echo "Step 3: Setting bridged packets to traverse iptables rules..."
+          cat <<EOF > /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          EOF
+          echo 1 > /proc/sys/net/ipv4/ip_forward
+          sysctl --system
+
+          echo "Step 4: Disabling all memory swaps..."
+          swapoff -a
+          if [ "$AUTO_HASH_SWAP" == "true" ]; then
+              sed -i '/\sswap\s/s/^/#/' /etc/fstab
+          fi
+
+          echo "Step 5: Enabling transparent masquerading and VxLAN..."
+          modprobe br_netfilter
+
+          echo "Installing Docker..."
+          yum install -y yum-utils dnf iproute-tc conntrack || true
+          yum install -y docker
+          systemctl enable --now docker
+
+          echo "Configuring Docker..."
+          cat <<EOF > /etc/docker/daemon.json
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            }
+          }
+          EOF
+          systemctl restart docker
+
+          echo "Installing Kubernetes..."
+          cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+          [kubernetes]
+          name=Kubernetes
+          baseurl=$K8S_REPO_URL
+          enabled=1
+          gpgcheck=0
+          gpgkey=$K8S_GPG_KEY
+          exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+          EOF
+          yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+          systemctl enable --now kubelet
+
+          echo "Configuring containerd..."
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+          systemctl restart containerd
+
+          echo "Initializing Kubernetes cluster..."
+          kubeadm init --pod-network-cidr "$POD_NETWORK_CIDR"
+
+          mkdir -p /root/.kube
+          cp -i /etc/kubernetes/admin.conf /root/.kube/config
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+
+          if [ -d /home/ec2-user ]; then
+              mkdir -p /home/ec2-user/.kube
+              cp -i /etc/kubernetes/admin.conf /home/ec2-user/.kube/config
+              chown -R ec2-user:ec2-user /home/ec2-user/.kube
+          fi
+
+          echo "Applying Pod network..."
+          kubectl apply -f $POD_NETWORK_URL
+
+          echo "Master installation complete."
+          echo "SSH in and run: kubeadm token create --print-join-command"
+          echo "Then run that command (as root/sudo) on each worker to join it."
+
+          echo "Install Helm"
+          curl -LO https://git.io/get_helm.sh
+          chmod 700 get_helm.sh
+          export PATH=$PATH:/usr/local/bin
+          ./get_helm.sh
+
+          echo "Install MlFlow using Helm"
+          helm repo add community-charts https://community-charts.github.io/helm-charts
+          helm install my-mlflow community-charts/mlflow --version 0.7.19
+
+
+  K8sWorkerInstance1:
+    Type: AWS::EC2::Instance
+    DependsOn: K8sMasterInstance
+    Properties:
+      ImageId: !Ref pLatestAmiId
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyPairName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref pSubnetId
+          GroupSet:
+            - !Ref K8sSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref pRootVolumeSizeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-k8s-worker-1"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > >(tee -a /var/log/k8s_install.log) 2>&1
+
+          K8S_REPO_URL="https://pkgs.k8s.io/core:/stable:/v1.34/rpm/"
+          K8S_GPG_KEY="https://pkgs.k8s.io/core:/stable:/v1.34/rpm/repodata/repomd.xml.key"
+          AUTO_HASH_SWAP="false"
+
+          echo "Starting Kubernetes worker installation..."
+
+          echo "Step 1: Removing old versions..."
+          yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman runc "kube*" || true
+
+          echo "Step 2: Disabling SELinux..."
+          command -v setenforce >/dev/null 2>&1 && setenforce 0 || true
+          [ -f /etc/sysconfig/selinux ] && sed -i --follow-symlinks 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/sysconfig/selinux || true
+
+          echo "Step 3: Setting bridged packets to traverse iptables rules..."
+          cat <<EOF > /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          EOF
+          echo 1 > /proc/sys/net/ipv4/ip_forward
+          sysctl --system
+
+          echo "Step 4: Disabling all memory swaps..."
+          swapoff -a
+          if [ "$AUTO_HASH_SWAP" == "true" ]; then
+              sed -i '/\sswap\s/s/^/#/' /etc/fstab
+          fi
+
+          echo "Step 5: Enabling transparent masquerading and VxLAN..."
+          modprobe br_netfilter
+
+          echo "Installing Docker..."
+          yum install -y yum-utils dnf iproute-tc conntrack || true
+          yum install -y docker
+          systemctl enable --now docker
+
+          echo "Configuring Docker..."
+          cat <<EOF > /etc/docker/daemon.json
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            }
+          }
+          EOF
+          systemctl restart docker
+
+          echo "Installing Kubernetes..."
+          cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+          [kubernetes]
+          name=Kubernetes
+          baseurl=$K8S_REPO_URL
+          enabled=1
+          gpgcheck=0
+          gpgkey=$K8S_GPG_KEY
+          exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+          EOF
+          yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+          systemctl enable --now kubelet
+
+          echo "Configuring containerd..."
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+          systemctl restart containerd
+
+          echo "Worker prerequisites installed. Waiting for you to run 'kubeadm join ...' manually."
+
+  K8sWorkerInstance2:
+    Type: AWS::EC2::Instance
+    DependsOn: K8sMasterInstance
+    Properties:
+      ImageId: !Ref pLatestAmiId
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyPairName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref pSubnetId
+          GroupSet:
+            - !Ref K8sSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref pRootVolumeSizeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-k8s-worker-2"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > >(tee -a /var/log/k8s_install.log) 2>&1
+
+          K8S_REPO_URL="https://pkgs.k8s.io/core:/stable:/v1.34/rpm/"
+          K8S_GPG_KEY="https://pkgs.k8s.io/core:/stable:/v1.34/rpm/repodata/repomd.xml.key"
+          AUTO_HASH_SWAP="false"
+
+          echo "Starting Kubernetes worker installation..."
+
+          echo "Step 1: Removing old versions..."
+          yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman runc "kube*" || true
+
+          echo "Step 2: Disabling SELinux..."
+          command -v setenforce >/dev/null 2>&1 && setenforce 0 || true
+          [ -f /etc/sysconfig/selinux ] && sed -i --follow-symlinks 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/sysconfig/selinux || true
+
+          echo "Step 3: Setting bridged packets to traverse iptables rules..."
+          cat <<EOF > /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          EOF
+          echo 1 > /proc/sys/net/ipv4/ip_forward
+          sysctl --system
+
+          echo "Step 4: Disabling all memory swaps..."
+          swapoff -a
+          if [ "$AUTO_HASH_SWAP" == "true" ]; then
+              sed -i '/\sswap\s/s/^/#/' /etc/fstab
+          fi
+
+          echo "Step 5: Enabling transparent masquerading and VxLAN..."
+          modprobe br_netfilter
+
+          echo "Installing Docker..."
+          yum install -y yum-utils dnf iproute-tc conntrack || true
+          yum install -y docker
+          systemctl enable --now docker
+
+          echo "Configuring Docker..."
+          cat <<EOF > /etc/docker/daemon.json
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            }
+          }
+          EOF
+          systemctl restart docker
+
+          echo "Installing Kubernetes..."
+          cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+          [kubernetes]
+          name=Kubernetes
+          baseurl=$K8S_REPO_URL
+          enabled=1
+          gpgcheck=0
+          gpgkey=$K8S_GPG_KEY
+          exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+          EOF
+          yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+          systemctl enable --now kubelet
+
+          echo "Configuring containerd..."
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+          systemctl restart containerd
+
+          echo "Worker prerequisites installed. Waiting for you to run 'kubeadm join ...' manually."
+
+Outputs:
+  MasterPublicIP:
+    Description: Public IP of the k8s master node
+    Value: !GetAtt K8sMasterInstance.PublicIp
+
+  Worker1PublicIP:
+    Description: Public IP of worker node 1
+    Value: !GetAtt K8sWorkerInstance1.PublicIp
+
+  Worker2PublicIP:
+    Description: Public IP of worker node 2
+    Value: !GetAtt K8sWorkerInstance2.PublicIp
+
+  SSHToMaster:
+    Description: SSH command to reach the master (kubeconfig at /root/.kube/config and /home/ec2-user/.kube/config)
+    Value: !Sub "ssh -i <your-key>.pem ec2-user@${K8sMasterInstance.PublicIp}"
+
+  SSHToWorker1:
+    Description: SSH command to reach worker 1
+    Value: !Sub "ssh -i <your-key>.pem ec2-user@${K8sWorkerInstance1.PublicIp}"
+
+  SSHToWorker2:
+    Description: SSH command to reach worker 2
+    Value: !Sub "ssh -i <your-key>.pem ec2-user@${K8sWorkerInstance2.PublicIp}"
