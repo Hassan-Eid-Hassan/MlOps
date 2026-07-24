@@ -193,7 +193,7 @@ Resources:
 
           echo "Install MlFlow using Helm"
           helm repo add community-charts https://community-charts.github.io/helm-charts
-          helm install my-mlflow community-charts/mlflow --version 0.7.19
+          helm install my-mlflow community-charts/mlflow --version 0.12.2
 
 
   K8sWorkerInstance1:

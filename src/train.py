@@ -80,7 +80,7 @@ def main():
         )
         mlflow.sklearn.log_model(
             model,
-            name="model",
+            artifact_path="model",
             signature=signature,
             input_example=data["train"]["X"].iloc[:2],
         )
