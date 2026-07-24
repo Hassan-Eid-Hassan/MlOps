@@ -36,12 +36,6 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
 
-      - name: Configure kubectl for the k8s cluster
-        run: |
-          mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > "$HOME/.kube/config"
-          kubectl cluster-info
-
       - name: Train model
         id: train
         run: python src/train.py --data-path data/diabetes.csv --params-path parameters.json
@@ -75,18 +69,9 @@ jobs:
           docker tag diabetes-model-server:${{ github.sha }} "$IMAGE_NAME:${{ github.sha }}"
           docker push "$IMAGE_NAME:${{ github.sha }}"
 
-      - name: Deploy model server to the remote cluster
-        if: steps.evaluate.outputs.promote == 'true'
-        run: |
-          sed "s#__IMAGE__#$IMAGE_NAME:${{ github.sha }}#" k8s/model-server-deployment.yaml | kubectl apply -f -
-          kubectl apply -f k8s/model-server-service.yaml
-          kubectl rollout status deployment/diabetes-model-server --timeout=180s
-
       - name: Smoke test the deployed model
         if: steps.evaluate.outputs.promote == 'true'
         run: |
-          kubectl port-forward svc/diabetes-model-server 8080:8080 &
-          sleep 5
-          curl -sf -X POST http://localhost:8080/invocations \
+          curl -sf -X POST http://${{ vars.MODEL_SERVER_URI }}/invocations \
             -H "Content-Type: application/json" \
             -d '{"dataframe_split": {"columns": ["AGE","SEX","BMI","BP","S1","S2","S3","S4","S5","S6"], "data": [[0.038,0.050,0.061,0.021,-0.044,-0.034,-0.043,-0.002,0.019,-0.017]]}}'
