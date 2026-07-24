@@ -48,12 +48,13 @@ jobs:
         if: steps.evaluate.outputs.promote == 'true'
         run: python src/register.py --run-id "${{ steps.train.outputs.run_id }}" --model-name "$MODEL_NAME"
 
-      - name: Build serving image from the registered model
+      - name: Download production model
         if: steps.evaluate.outputs.promote == 'true'
-        run: |
-          mlflow models build-docker \
-            --model-uri "models:/${MODEL_NAME}@production" \
-            --name "diabetes-model-server:${{ github.sha }}"
+        run: mlflow artifacts download --artifact-uri "models:/${MODEL_NAME}@production" --dst-path ./model
+
+      - name: Build serving image
+        if: steps.evaluate.outputs.promote == 'true'
+        run: docker build -f Dockerfile.model-server -t "diabetes-model-server:${{ github.sha }}" .
 
       - name: Log in to GHCR
         if: steps.evaluate.outputs.promote == 'true'

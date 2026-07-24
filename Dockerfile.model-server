@@ -1,0 +1,39 @@
+# Serves the registered "diabetes_regression_model" via MLflow's pyfunc
+# scoring server.
+#
+# This builds directly on a pinned Python base instead of using
+# `mlflow models build-docker`. That command auto-generates a Dockerfile
+# that bootstraps pip via `apt install python3.9 ... && get-pip.py`, and
+# the (unpinned) get-pip.py script now refuses to run on Python < 3.10 -
+# breaking the build with no code change on our side. Building our own
+# image avoids that fragile, unpinned bootstrap entirely and keeps
+# training/serving dependency versions in sync via the same
+# requirements.txt used by src/train.py.
+#
+# CI (.github/workflows/mlops-pipeline.yml) downloads the promoted model
+# into ./model with `mlflow artifacts download` before running
+# `docker build -f Dockerfile.model-server .`
+
+FROM python:3.11-slim
+
+WORKDIR /opt/mlflow
+
+# build-essential covers any packages without prebuilt linux wheels.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Populated by the CI step that runs `mlflow artifacts download` before
+# this Dockerfile is built - see mlops-pipeline.yml.
+COPY model/ ./model/
+
+EXPOSE 8080
+
+CMD ["mlflow", "models", "serve", \
+     "-m", "./model", \
+     "--host", "0.0.0.0", \
+     "--port", "8080", \
+     "--env-manager", "local"]
