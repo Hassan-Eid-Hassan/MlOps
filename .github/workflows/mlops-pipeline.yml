@@ -5,7 +5,6 @@ on:
 
 env:
   MODEL_NAME: diabetes_regression_model
-  IMAGE_NAME: ghcr.io/${{ github.repository }}/diabetes-model-server
 
 jobs:
   # ---------------------------------------------------------------------
@@ -31,6 +30,10 @@ jobs:
       MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        run: echo "IMAGE_NAME=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/diabetes-model-server" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

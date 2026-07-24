@@ -186,15 +186,19 @@ Resources:
           echo "Then run that command (as root/sudo) on each worker to join it."
 
           echo "Install Helm"
-          curl -LO https://git.io/get_helm.sh
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
           chmod 700 get_helm.sh
           export PATH=$PATH:/usr/local/bin
           ./get_helm.sh
 
           echo "Install MlFlow using Helm"
           helm repo add community-charts https://community-charts.github.io/helm-charts
-          helm install my-mlflow community-charts/mlflow --version 0.12.2
-
+          cat <<EOF > values.yaml
+          artifactRoot:
+            proxiedArtifactStorage: true
+          EOF
+          helm install my-mlflow community-charts/mlflow --version 0.12.2 -f values.yaml
+          kubectl patch svc my-mlflow --type='merge' -p '{"spec":{"type":"NodePort","ports":[{"port": 5000,"targetPort": 5000,"protocol": "TCP","nodePort": 30500}]}}'
 
   K8sWorkerInstance1:
     Type: AWS::EC2::Instance
